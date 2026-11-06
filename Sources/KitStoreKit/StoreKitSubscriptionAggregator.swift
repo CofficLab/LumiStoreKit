@@ -148,6 +148,66 @@ public enum StoreKitSubscriptionAggregator {
         )
     }
 
+    /// 把一笔新交易**并入**已有的订阅持有情况。
+    ///
+    /// ## 为什么需要「合并」而不是「覆盖」
+    ///
+    /// `aggregate` 是**全量**计算：从一组交易推出完整的持有情况。
+    /// 但交易监听收到的是**增量**——每次只有一笔新交易。
+    ///
+    /// 若用单笔交易构造 holding 并整体覆盖，会产生两个严重的权益错误：
+    /// 1. **期限被改写**：已买一年期后再买月付，权益从「一年」被改写成
+    ///    「一个月」——用户买了更长的档期反而被降级。
+    /// 2. **既有权益丢失**：同时持有 monthly + yearly 时，新交易会把
+    ///    holding 整个替换成只含新商品的那一份，年付从集合里消失。
+    ///
+    /// 合并语义与 `aggregate` 一致：商品 ID 取**并集**，到期时间取**最晚**。
+    ///
+    /// ## 边界语义
+    ///
+    /// - 新交易已过期或无有效期限 → **不改变**既有持有情况。
+    ///   一笔无效交易不应抹掉用户已有的订阅。
+    /// - 新交易的期限更短 → 保留更晚的那个，不缩短既有权益。
+    ///
+    /// - Parameters:
+    ///   - current: 当前持有的订阅情况。
+    ///   - transaction: 新到达的交易凭据。
+    ///   - now: 当前时间（过期判定基准）。
+    /// - Returns: 合并后的持有情况。
+    public static func merging(
+        current: StoreKitSubscriptionHolding,
+        transaction: StoreKitTransactionSummary,
+        now: Date = Date()
+    ) -> StoreKitSubscriptionHolding {
+        guard transaction.productType.isSubscription else {
+            // 消耗品与一次性解锁不授予订阅权益。
+            return current
+        }
+
+        guard let expiration = effectiveExpiration(for: transaction, now: now) else {
+            // 已过期或无有效期限的交易不贡献任何权益，
+            // 也不影响既有权益。
+            return current
+        }
+
+        // 商品 ID 取并集（保持既有顺序，新商品追加在后）。
+        var productIDs = current.activeSubscriptionProductIDs
+        if !productIDs.contains(transaction.productID) {
+            productIDs.append(transaction.productID)
+        }
+
+        // 到期时间取最晚：新交易不该缩短既有权益的期限。
+        let latestExpiration = max(
+            current.latestExpiration ?? expiration,
+            expiration
+        )
+
+        return StoreKitSubscriptionHolding(
+            activeSubscriptionProductIDs: productIDs,
+            latestExpiration: latestExpiration
+        )
+    }
+
     /// 计算一笔交易的有效到期时间。
     ///
     /// - Returns: 有效到期时间；已过期或无有效期限时为 `nil`。
