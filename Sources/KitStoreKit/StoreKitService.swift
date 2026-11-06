@@ -313,21 +313,36 @@ public actor StoreKitService {
         }
     }
 
-    /// 应用一笔交易：更新有效订阅与到期时间。
+    /// 应用一笔交易：把它**并入**当前的有效订阅集合。
+    ///
+    /// ## 为什么是合并而不是覆盖
+    ///
+    /// 早期实现用单笔交易构造 holding 并整体 `updateHolding` 覆盖，
+    /// 与 `calibrateFromCurrentEntitlements` 的聚合语义不一致，带来两个
+    /// 严重的权益错误：
+    ///
+    /// 1. **期限被改写**：已买 `pro.year.1`（一年）后再买 `pro.monthly`，
+    ///    权益会从「一年」被改写成「一个月」——用户明明买了更长的档期，
+    ///    反而被降级。
+    /// 2. **年付权益丢失**：同时持有 monthly + yearly 时，新交易会把
+    ///    holding 整个替换成只含新商品的那一份，年付从集合里消失。
+    ///
+    /// 修复方式：新交易的有效商品 ID **并入**现有集合（去重），
+    /// 到期时间取**最晚**的那个——与 `StoreKitSubscriptionAggregator.aggregate`
+    /// 的语义一致。
+    ///
+    /// ## 与校准的关系
+    ///
+    /// 校准（`calibrateFromCurrentEntitlements`）是「以商店为准」的权威同步，
+    /// 它会**整体替换** holding。交易监听则是**增量**：新交易只能让权益
+    /// 增加，不能让既有权益凭空消失。两者的语义本就不同。
     private func applyTransaction(_ summary: StoreKitTransactionSummary) async {
-        guard summary.productType.isSubscription else {
-            // 消耗品与一次性解锁不授予订阅权益。
-            return
-        }
-
-        let expiration = StoreKitSubscriptionAggregator.effectiveExpiration(
-            for: summary,
+        // 合并语义：把新交易**并入**当前持有，而不是用单笔交易覆盖。
+        // 详见 `StoreKitSubscriptionAggregator.merging` 的文档。
+        let holding = StoreKitSubscriptionAggregator.merging(
+            current: cachedHolding,
+            transaction: summary,
             now: Date()
-        )
-
-        let holding = StoreKitSubscriptionHolding(
-            activeSubscriptionProductIDs: expiration == nil ? [] : [summary.productID],
-            latestExpiration: expiration
         )
 
         await updateHolding(holding)
